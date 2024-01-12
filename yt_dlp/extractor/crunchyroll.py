@@ -350,6 +350,7 @@ class CrunchyrollBaseIE(InfoExtractor):
         # Return merged results
         return result
 
+
 class CrunchyrollCmsBaseIE(CrunchyrollBaseIE):
     _API_ENDPOINT = 'cms'
     _CMS_EXPIRY = None
