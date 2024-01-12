@@ -73,7 +73,7 @@ class TubiTvIE(TubiTvBaseIE):
             'release_year': 1979,
         },
         'skip': 'Content Unavailable'
-         }, {
+    }, {
         # movie (Tubi original movie 'Swim', lower likelihood of becoming unavailable)
         'url': 'https://tubitv.com/movies/613766/swim?start=true',
         'md5': 'acde434a720fb2e22cb96bf8b99a102d',
