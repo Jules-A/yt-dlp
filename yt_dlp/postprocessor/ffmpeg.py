@@ -349,6 +349,8 @@ class FFmpegPostProcessor(PostProcessor):
                     keys.append('')
             args += self._configuration_args(self.basename, keys)
             if name == 'i':
+                if determine_ext(file) == 'ass':
+                    args.append('-fix_sub_duration')
                 args.append('-i')
             return (
                 [encodeArgument(arg) for arg in args]
