@@ -1,4 +1,6 @@
 import base64
+import typing
+import uuid
 
 from .common import InfoExtractor
 from ..networking.exceptions import HTTPError
@@ -7,14 +9,16 @@ from ..utils import (
     float_or_none,
     format_field,
     int_or_none,
-    join_nonempty,
+    jwt_decode_hs256,
     parse_age_limit,
     parse_count,
     parse_iso8601,
     qualities,
     remove_start,
+    smuggle_url,
     time_seconds,
     traverse_obj,
+    unsmuggle_url,
     url_or_none,
     urlencode_postdata,
 )
@@ -24,6 +28,7 @@ class CrunchyrollBaseIE(InfoExtractor):
     _BASE_URL = 'https://www.crunchyroll.com'
     _API_BASE = 'https://api.crunchyroll.com'
     _NETRC_MACHINE = 'crunchyroll'
+    _ACCESS_TOKEN = None
     _AUTH_HEADERS = None
     _API_ENDPOINT = None
     _BASIC_AUTH = None
@@ -45,6 +50,10 @@ class CrunchyrollBaseIE(InfoExtractor):
     @property
     def is_logged_in(self):
         return bool(self._get_cookies(self._BASE_URL).get('etp_rt'))
+    
+    @property
+    def is_premium(self):
+        return 'cr_premium' in jwt_decode_hs256(self._ACCESS_TOKEN).get('benefits', [])
 
     def _perform_login(self, username, password):
         if self.is_logged_in:
@@ -86,9 +95,13 @@ class CrunchyrollBaseIE(InfoExtractor):
 
         grant_type = 'etp_rt_cookie' if self.is_logged_in else 'client_id'
         try:
+            auth_headers = {'Authorization': CrunchyrollBaseIE._BASIC_AUTH}
+            if not self.is_logged_in:
+                auth_headers['ETP-Anonymous-ID'] = uuid.uuid4()
+
             auth_response = self._download_json(
                 f'{self._BASE_URL}/auth/v1/token', None, note=f'Authenticating with grant_type={grant_type}',
-                headers={'Authorization': CrunchyrollBaseIE._BASIC_AUTH}, data=f'grant_type={grant_type}'.encode())
+                headers=auth_headers, data=f'grant_type={grant_type}'.encode())
         except ExtractorError as error:
             if isinstance(error.cause, HTTPError) and error.cause.status == 403:
                 raise ExtractorError(
@@ -135,47 +148,134 @@ class CrunchyrollBaseIE(InfoExtractor):
             raise ExtractorError(f'Unexpected response when downloading {note} JSON')
         return result
 
-    def _extract_formats(self, stream_response, display_id=None):
-        requested_formats = self._configuration_arg('format') or ['vo_adaptive_hls']
-        available_formats = {}
-        for stream_type, streams in traverse_obj(
-                stream_response, (('streams', ('data', 0)), {dict.items}, ...)):
-            if stream_type not in requested_formats:
+    def _get_requested_langs_from_extractor_args(self, ie_key=None):
+        return self._configuration_arg('language', ie_key=ie_key, casesense=False)
+
+    @staticmethod
+    def _format_audio_lang(audio_lang: str) -> str:
+        return audio_lang.casefold().strip()
+
+    @staticmethod
+    def _format_requested_langs(requested_langs):
+        # Requested Language options:
+        # 'default'   = Include audio language of video with 'internal_id'
+        # 'unknown'   = Include all unknown audio languages
+        # 'all'       = Include all possible languages (will override all other options)
+        # <lang-code> = Include specific audio language e.g. 'ja-JP' or 'en-US'
+
+        # Format requested_langs
+        lang_formatter = CrunchyrollBaseIE._format_audio_lang
+        requested_langs = list(map(lang_formatter, requested_langs or ['default']))
+        if 'all' in requested_langs:
+            requested_langs = []
+        return requested_langs
+
+    @staticmethod
+    def _get_audio_langs_from_data(data):
+        lang_formatter = CrunchyrollBaseIE._format_audio_lang
+        wrap_in_list = lambda v: v and [v]
+
+        # Find audio languages in 'audio_locales' and 'audio_locale' and merge them into a case-folded set
+        audio_langs = set(traverse_obj(data, ('audio_locales', ..., {lang_formatter}), default=[]))
+        audio_langs.update(traverse_obj(data, ('audio_locale', {lang_formatter}, {wrap_in_list}), default=[]))
+        return audio_langs
+
+    @staticmethod
+    def _get_requested_lang_evaluator(requested_langs):
+        def is_requested_lang(audio_langs, allow_if_unknown=False):
+            audio_langs = audio_langs or {'unknown'}
+            # Is True if 'requested_langs' is empty ('all' languages were requested / are allowed)
+            # or if 'allow_if_unknown' is set and no language codes are specified in 'audio_langs'
+            # or if any of the specified languages in 'audio_langs' is in 'requested_langs'
+            return not requested_langs \
+                or (allow_if_unknown and 'unknown' in audio_langs) \
+                or any(la in requested_langs for la in audio_langs)
+        return is_requested_lang
+
+    @staticmethod
+    def _wrap_requested_lang_in_data_evaluator(requested_langs, is_requested_lang):
+        def is_requested_lang_in_data(data, allow_if_unknown=False):
+            # Is True if 'requested_langs' is empty ('all' languages were requested / are allowed)
+            # or if 'allow_if_unknown' is set and no language codes were found in 'data'
+            # or if any of the found languages from 'data' is in 'requested_langs'
+            return not requested_langs or is_requested_lang(
+                CrunchyrollBaseIE._get_audio_langs_from_data(data),
+                allow_if_unknown)
+        return is_requested_lang_in_data
+
+    @staticmethod
+    def _has_requested_default_lang(requested_langs):
+        return 'default' in requested_langs
+
+    def _get_responses_for_langs(self, internal_id, get_response_by_id, requested_langs):
+        requested_langs = self._format_requested_langs(requested_langs)
+        is_requested_lang = self._get_requested_lang_evaluator(requested_langs)
+        is_requested_lang_in_data = self._wrap_requested_lang_in_data_evaluator(
+            requested_langs, is_requested_lang)
+
+        def get_meta_from_response(response):
+            object_type = response.get('type')
+            return object_type and traverse_obj(response, f'{object_type}_metadata')
+
+        # Get default response and its metadata
+        default_response = get_response_by_id(internal_id)
+        if not default_response:
+            raise ExtractorError(
+                f'No video with id {internal_id} could be found (possibly region locked?)',
+                expected=True)
+        default_meta = get_meta_from_response(default_response)
+
+        # Result dict to store requested responses in
+        results = {}
+
+        # Add default response if requested
+        if self._has_requested_default_lang(requested_langs) \
+                or (default_meta and is_requested_lang_in_data(default_meta)):
+            results[internal_id] = default_response
+
+        # Iterate other versions and add them if requested
+        versions = (default_meta and traverse_obj(default_meta, 'versions')) or []
+        requested_versions = [version for version in versions
+                              if version and is_requested_lang_in_data(version)]
+        for version in requested_versions:
+            version_id = version.get('guid')
+            if not version_id or version_id in results:
                 continue
-            for stream in traverse_obj(streams, lambda _, v: v['url']):
-                hardsub_lang = stream.get('hardsub_locale') or ''
-                format_id = join_nonempty(stream_type, format_field(stream, 'hardsub_locale', 'hardsub-%s'))
-                available_formats[hardsub_lang] = (stream_type, format_id, hardsub_lang, stream['url'])
+            # Fetch response for current version (will be on a different video page)
+            requested_response = get_response_by_id(version_id)
+            if not requested_response:
+                self.to_screen(
+                    f'Requested video version with id {version_id} could not be found (possibly region locked?)',
+                    only_once=True)
+                continue
+            results[version_id] = requested_response
 
-        requested_hardsubs = [('' if val == 'none' else val) for val in (self._configuration_arg('hardsub') or ['none'])]
-        if '' in available_formats and 'all' not in requested_hardsubs:
-            full_format_langs = set(requested_hardsubs)
-            self.to_screen(
-                'To get all formats of a hardsub language, use '
-                '"--extractor-args crunchyrollbeta:hardsub=<language_code or all>". '
-                'See https://github.com/yt-dlp/yt-dlp#crunchyrollbeta-crunchyroll for more info',
-                only_once=True)
+        return results
+
+    def _extract_stream(self, internal_id, is_music):
+        if is_music:
+            object_type = 'music/'
         else:
-            full_format_langs = set(map(str.lower, available_formats))
+            object_type = ''
 
-        audio_locale = traverse_obj(stream_response, ((None, 'meta'), 'audio_locale'), get_all=False)
+        return self._download_json(
+            f'https://cr-play-service.prd.crunchyrollsvc.com/v1/{object_type}{internal_id}/console/switch/play',
+            internal_id, note='stream info', headers=CrunchyrollBaseIE._AUTH_HEADERS)
+
+    def _extract_formats(self, stream_response, display_id=None):
+        available_formats = {'': ('', '', stream_response['url'])}
+        for hardsub_lang, stream in traverse_obj(stream_response, ('hardSubs', {dict.items}, ...)):
+            available_formats[hardsub_lang] = (f'hardsub-{hardsub_lang}', hardsub_lang, stream['url'])
+            
+        requested_hardsubs = [('' if val == 'none' else val) for val in (self._configuration_arg('hardsub') or ['none'])]
+
+        audio_locale = stream_response.get('audioLocale')
         hardsub_preference = qualities(requested_hardsubs[::-1])
         formats = []
-        for stream_type, format_id, hardsub_lang, stream_url in available_formats.values():
-            if stream_type.endswith('hls'):
-                if hardsub_lang.lower() in full_format_langs:
-                    adaptive_formats = self._extract_m3u8_formats(
-                        stream_url, display_id, 'mp4', m3u8_id=format_id,
-                        fatal=False, note=f'Downloading {format_id} HLS manifest')
-                else:
-                    adaptive_formats = (self._m3u8_meta_format(stream_url, ext='mp4', m3u8_id=format_id),)
-            elif stream_type.endswith('dash'):
-                adaptive_formats = self._extract_mpd_formats(
-                    stream_url, display_id, mpd_id=format_id,
-                    fatal=False, note=f'Downloading {format_id} MPD manifest')
-            else:
-                self.report_warning(f'Encountered unknown stream_type: {stream_type!r}', display_id, only_once=True)
-                continue
+        for format_id, hardsub_lang, stream_url in available_formats.values():
+            adaptive_formats = self._extract_mpd_formats(
+                stream_url, display_id, mpd_id=format_id, headers=CrunchyrollBaseIE._AUTH_HEADERS,
+                fatal=False, note=f'Downloading {f"hardsub {hardsub_lang} " if hardsub_lang else ""}MPD manifest')
             for f in adaptive_formats:
                 if f.get('acodec') != 'none':
                     f['language'] = audio_locale
@@ -191,6 +291,57 @@ class CrunchyrollBaseIE(InfoExtractor):
             subtitles[locale] = [traverse_obj(subtitle, {'url': 'url', 'ext': 'format'})]
 
         return subtitles
+
+    @staticmethod
+    def _extract_versions_and_merge_results(lang, internal_id, responses, extract_version):
+        # If only one language was requested, extract and return its version (no merge required)
+        if len(responses) == 1:
+            target_id, target_response = next(iter(responses.items()))
+            return extract_version(lang, target_id, target_response)
+
+        # If multiple languages were requested, extract all versions and merge them
+        # NOTE: Returned arguments such as 'title', 'season', 'season_id', etc. may differ
+        # from version to version. In each format, include what is different (compared to the
+        # main result). Choosing a format with '-f' now applies the correct arguments.
+        # ALSO: Differences in non-hashable arguments are not included in the formats.
+
+        # Extract main response from 'responses'. Favour the one with 'internal_id'
+        version_id, version_response = (internal_id, responses.pop(internal_id, None))
+        if not version_response:
+            # If 'internal_id' was excluded then use some other item. Its
+            # arguments are overridden when a format is selected anyway.
+            version_id, version_response = responses.popitem()
+
+        # Function to check whether an attribute (key value pair) is hashable
+        def is_attribute_hashable(attribute):
+            key, value = attribute
+            return isinstance(key, typing.Hashable) \
+                and isinstance(value, typing.Hashable)
+
+        # Extract main result (used to merge other results)
+        result = extract_version(lang, version_id, version_response)
+        result_formats = result.setdefault('formats', [])
+        result_subtitles = result.setdefault('subtitles', {})
+        result_as_set = set(filter(is_attribute_hashable, result.items()))
+
+        # Merge all formats and subtitles into main result
+        for version_id, version_response in responses.items():
+            version = extract_version(lang, version_id, version_response)
+            version_formats = version.get('formats') or []
+            version_subtitles = version.get('subtitles') or {}
+            version_as_set = set(filter(is_attribute_hashable, version.items()))
+
+            # Only add differences to every format
+            version_differences = dict(version_as_set - result_as_set)
+            for version_format in version_formats:
+                version_format.update(version_differences)
+
+            # Add version formats and subtitles to result
+            result_formats.extend(version_formats)
+            result_subtitles.update(version_subtitles)
+
+        # Return merged results
+        return result
 
 
 class CrunchyrollCmsBaseIE(CrunchyrollBaseIE):
@@ -327,14 +478,26 @@ class CrunchyrollBetaIE(CrunchyrollCmsBaseIE):
     _RETURN_TYPE = 'video'
 
     def _real_extract(self, url):
+        url, smuggled_data = unsmuggle_url(url, default={})
         lang, internal_id = self._match_valid_url(url).group('lang', 'id')
 
-        # We need to use unsigned API call to allow ratings query string
-        response = traverse_obj(self._call_api(
-            f'objects/{internal_id}', internal_id, lang, 'object info', {'ratings': 'true'}), ('data', 0, {dict}))
-        if not response:
-            raise ExtractorError(f'No video with id {internal_id} could be found (possibly region locked?)', expected=True)
+        def get_response_by_id(requested_id):
+            # We need to use unsigned API call to allow ratings query string
+            return traverse_obj(self._call_api(
+                f'objects/{requested_id}', requested_id, lang, 'object info', {'ratings': 'true'}), ('data', 0, {dict}))
 
+        # Fetch requested language responses
+        requested_langs = traverse_obj(smuggled_data, ('target_audio_langs', {list}))
+        requested_langs = requested_langs or self._get_requested_langs_from_extractor_args()
+        responses = self._get_responses_for_langs(internal_id, get_response_by_id, requested_langs)
+        if not responses:
+            raise ExtractorError(
+                'None of the requested audio languages were found',
+                expected=True)
+        return self._extract_versions_and_merge_results(
+            lang, internal_id, responses, self._extract_version)
+
+    def _extract_version(self, lang, internal_id, response):
         object_type = response.get('type')
         if object_type == 'episode':
             result = self._transform_episode_response(response)
@@ -359,18 +522,12 @@ class CrunchyrollBetaIE(CrunchyrollCmsBaseIE):
         else:
             raise ExtractorError(f'Unknown object type {object_type}')
 
-        # There might be multiple audio languages for one object (`<object>_metadata.versions`),
-        # so we need to get the id from `streams_link` instead or we dont know which language to choose
-        streams_link = response.get('streams_link')
-        if not streams_link and traverse_obj(response, (f'{object_type}_metadata', 'is_premium_only')):
+        if traverse_obj(response, (f'{object_type}_metadata', 'is_premium_only')) and not self.is_premium:
             message = f'This {object_type} is for premium members only'
-            if self.is_logged_in:
-                raise ExtractorError(message, expected=True)
             self.raise_login_required(message)
 
         # We need go from unsigned to signed api to avoid getting soft banned
-        stream_response = self._call_cms_api_signed(remove_start(
-            streams_link, '/content/v2/cms/'), internal_id, lang, 'stream info')
+        stream_response = self._extract_stream(internal_id, False)
         result['formats'] = self._extract_formats(stream_response, internal_id)
         result['subtitles'] = self._extract_subtitles(stream_response)
 
@@ -474,14 +631,38 @@ class CrunchyrollBetaShowIE(CrunchyrollCmsBaseIE):
     def _real_extract(self, url):
         lang, internal_id = self._match_valid_url(url).group('lang', 'id')
 
+        # Fetch requested languages (for Crunchyroll 'single episode' extractor)
+        requested_langs = self._get_requested_langs_from_extractor_args(ie_key=CrunchyrollBetaIE.ie_key())
+        requested_langs = self._format_requested_langs(requested_langs)
+        if self._has_requested_default_lang(requested_langs):
+            # If default is specified, use the default behavior (i.e. all languages are extracted).
+            # An empty array means allow any language (the same as if 'all' were set).
+            requested_langs = []
+        is_requested_lang = self._get_requested_lang_evaluator(requested_langs)
+
         def entries():
             seasons_response = self._call_cms_api_signed(f'seasons?series_id={internal_id}', internal_id, lang, 'seasons')
             for season in traverse_obj(seasons_response, ('items', ..., {dict})):
+                # Skip the extraction of a 'season' if its language is known, and it was not requested
+                # (If the language of 'season' is unknown then do not skip it -> Hence 'allow_if_unknown=True')
+                season_audio_langs = self._get_audio_langs_from_data(season)
+                if not is_requested_lang(season_audio_langs, allow_if_unknown=True):
+                    continue
+
                 episodes_response = self._call_cms_api_signed(
                     f'episodes?season_id={season["id"]}', season["id"], lang, 'episode list')
                 for episode_response in traverse_obj(episodes_response, ('items', ..., {dict})):
+                    # Skip the extraction of an episode if its language was not requested
+                    episode_audio_langs = self._get_audio_langs_from_data(episode_response)
+                    if not is_requested_lang(episode_audio_langs):
+                        continue
+
+                    smuggled_data = {
+                        'target_audio_langs': list(episode_audio_langs) or ['default'],
+                    }
+
                     yield self.url_result(
-                        f'{self._BASE_URL}/{lang}watch/{episode_response["id"]}',
+                        smuggle_url(f'{self._BASE_URL}/{lang}watch/{episode_response["id"]}', smuggled_data),
                         CrunchyrollBetaIE, **CrunchyrollBetaIE._transform_episode_response(episode_response))
 
         return self.playlist_result(
@@ -566,15 +747,12 @@ class CrunchyrollMusicIE(CrunchyrollBaseIE):
         if not response:
             raise ExtractorError(f'No video with id {internal_id} could be found (possibly region locked?)', expected=True)
 
-        streams_link = response.get('streams_link')
-        if not streams_link and response.get('isPremiumOnly'):
+        if response.get('isPremiumOnly') and not self.is_premium:
             message = f'This {response.get("type") or "media"} is for premium members only'
-            if self.is_logged_in:
-                raise ExtractorError(message, expected=True)
             self.raise_login_required(message)
 
         result = self._transform_music_response(response)
-        stream_response = self._call_api(streams_link, internal_id, lang, 'stream info')
+        stream_response = self._extract_stream(internal_id, True)
         result['formats'] = self._extract_formats(stream_response, internal_id)
 
         return result
