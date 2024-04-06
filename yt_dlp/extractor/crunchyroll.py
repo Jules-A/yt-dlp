@@ -160,6 +160,11 @@ class CrunchyrollBaseIE(InfoExtractor):
             end = traverse_obj(skip_events, (event, 'end', {float_or_none}))
             # some chapters have no start and/or ending time, they will just be ignored
             if start is None or end is None:
+                continue
+            chapters.append({'title': event.capitalize(), 'start_time': start, 'end_time': end})
+
+        return chapters
+
     def _get_requested_langs_from_extractor_args(self, ie_key=None):
         return self._configuration_arg('language', ie_key=ie_key, casesense=False)
 
@@ -264,16 +269,6 @@ class CrunchyrollBaseIE(InfoExtractor):
 
         return results
 
-    def _extract_formats(self, stream_response, display_id=None):
-        requested_formats = self._configuration_arg('format') or ['vo_adaptive_hls']
-        available_formats = {}
-        for stream_type, streams in traverse_obj(
-                stream_response, (('streams', ('data', 0)), {dict.items}, ...)):
-            if stream_type not in requested_formats:
-                continue
-            chapters.append({'title': event.capitalize(), 'start_time': start, 'end_time': end})
-
-        return chapters
 
     def _extract_stream(self, identifier, display_id=None):
         if not display_id:
