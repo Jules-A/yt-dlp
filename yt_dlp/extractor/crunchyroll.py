@@ -14,7 +14,6 @@ from ..utils import (
     parse_count,
     parse_iso8601,
     qualities,
-    remove_start,
     smuggle_url,
     time_seconds,
     traverse_obj,
@@ -281,7 +280,6 @@ class CrunchyrollBaseIE(InfoExtractor):
             results[version_id] = requested_response
 
         return results
-
 
     def _extract_stream(self, identifier, display_id=None):
         if not display_id:
