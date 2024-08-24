@@ -7,46 +7,47 @@ from ..utils import (
     int_or_none,
     js_to_json,
     traverse_obj,
-    url_or_none,
     urlencode_postdata,
+    smuggle_url,
+    unsmuggle_url
 )
 
 
-class TubiTvIE(InfoExtractor):
-    IE_NAME = 'tubitv'
-    _VALID_URL = r'https?://(?:www\.)?tubitv\.com/(?P<type>video|movies|tv-shows)/(?P<id>\d+)'
+class TubiTvBaseIE(InfoExtractor):
+
+    def _parse_page_data(self, webpage, show_id):
+        return self._parse_json(self._search_regex(
+            r'window\.__data\s*=\s*({[^<]+});\s*</script>',
+            webpage, 'data'), show_id, transform_source=js_to_json)['video']
+
+    def _get_show_title(self, show_json, show_id):
+        return traverse_obj(show_json, ('byId', '0' + show_id, 'title'))
+
+
+class TubiTvIE(TubiTvBaseIE):
+    _VALID_URL = r'''(?x)
+                    (?:
+                        tubitv:|
+                        https?://(?:www\.)?tubitv\.com/(?:video|movies|tv-shows)/
+                    )
+                    (?P<id>[0-9]+)'''
     _LOGIN_URL = 'http://tubitv.com/login'
     _NETRC_MACHINE = 'tubitv'
+    _GEO_COUNTRIES = ['US']
     _TESTS = [{
-        'url': 'https://tubitv.com/movies/100004539/the-39-steps',
+        'url': 'https://tubitv.com/movies/383676/tracker',
+        'md5': '566fa0f76870302d11af0de89511d3f0',
         'info_dict': {
-            'id': '100004539',
+            'id': '383676',
             'ext': 'mp4',
-            'title': 'The 39 Steps',
-            'description': 'md5:bb2f2dd337f0dc58c06cb509943f54c8',
-            'uploader_id': 'abc2558d54505d4f0f32be94f2e7108c',
-            'release_year': 1935,
+            'title': 'Tracker',
+            'description': 'md5:ff320baf43d0ad2655e538c1d5cd9706',
+            'uploader_id': 'f866e2677ea2f0dff719788e4f7f9195',
+            'release_year': 2010,
             'thumbnail': r're:^https?://.+\.(jpe?g|png)$',
-            'duration': 5187,
+            'duration': 6122,
         },
-        'params': {'skip_download': 'm3u8'},
-    }, {
-        'url': 'https://tubitv.com/tv-shows/554628/s01-e01-rise-of-the-snakes',
-        'info_dict': {
-            'id': '554628',
-            'ext': 'mp4',
-            'title': 'S01:E01 - Rise of the Snakes',
-            'description': 'md5:ba136f586de53af0372811e783a3f57d',
-            'episode': 'Rise of the Snakes',
-            'episode_number': 1,
-            'season': 'Season 1',
-            'season_number': 1,
-            'uploader_id': '2a9273e728c510d22aa5c57d0646810b',
-            'release_year': 2011,
-            'thumbnail': r're:^https?://.+\.(jpe?g|png)$',
-            'duration': 1376,
-        },
-        'params': {'skip_download': 'm3u8'},
+        'skip': 'Content Unavailable'
     }, {
         'url': 'http://tubitv.com/video/283829/the_comedian_at_the_friday',
         'md5': '43ac06be9326f41912dc64ccf7a80320',
@@ -57,7 +58,7 @@ class TubiTvIE(InfoExtractor):
             'description': 'A stand up comedian is forced to look at the decisions in his life while on a one week trip to the west coast.',
             'uploader_id': 'bc168bee0d18dd1cb3b86c68706ab434',
         },
-        'skip': 'Content Unavailable',
+        'skip': 'Content Unavailable'
     }, {
         'url': 'http://tubitv.com/tv-shows/321886/s01_e01_on_nom_stories',
         'only_matching': True,
@@ -71,7 +72,48 @@ class TubiTvIE(InfoExtractor):
             'uploader_id': 'd8fed30d4f24fcb22ec294421b9defc2',
             'release_year': 1979,
         },
-        'skip': 'Content Unavailable',
+        'skip': 'Content Unavailable'
+    }, {
+        # movie (Tubi original movie 'Swim', lower likelihood of becoming unavailable)
+        'url': 'https://tubitv.com/movies/613766/swim?start=true',
+        'md5': 'acde434a720fb2e22cb96bf8b99a102d',
+        'info_dict': {
+            'id': '613766',
+            'ext': 'mp4',
+            'title': 'Swim',
+            'uploader_id': '6b82d97d873a91e75936a79c984c9b65',
+            'release_year': 2021,
+            'duration': 5208,
+            'description': 'md5:77a9064861aedbe0761ce7b2b4fce26e',
+            'thumbnail': r're:^https?://.*\.jpg$',
+        }
+    }, {
+        # episode (Tubi original series 'The Freak Brothers', lower likelihood of becoming unavailable)
+        'url': 'https://tubitv.com/tv-shows/624837/s01-e01-pilot?start=true',
+        'md5': 'c38ef60e8b3ff8b15d4c5780a2cae5f6',
+        'info_dict': {
+            'id': '624837',
+            'ext': 'mp4',
+            'uploader_id': '8362002ebcb54c3aeee2431cbf075e8e',
+            'series': 'The Freak Brothers',
+            'duration': 1536,
+            'season_number': 1,
+            'title': 'S01:E01 - Pilot',
+            'release_year': 2021,
+            'episode_number': 1,
+            'season': 'Season 1',
+            'episode': 'Pilot',
+            'description': 'After smoking the magical weed sauce, four stoners get flung fifty years into the future.',
+            'thumbnail': r're:^https?://.*\.jpg$',
+        }
+    }, {
+        # "video" (redirects to "movies" or "tv-shows" in browser depending on media type, in this case to Tubi original movie 'Swim')
+        'url': 'https://tubitv.com/video/613766/swim',
+        'only_matching': True
+    }, {
+        # alternative to URL
+        'url': 'tubitv:613766',
+        'only_matching': True
     }]
 
     # DRM formats are included only to raise appropriate error
@@ -94,109 +136,130 @@ class TubiTvIE(InfoExtractor):
                 'Login failed (invalid username/password)', expected=True)
 
     def _real_extract(self, url):
-        video_id, video_type = self._match_valid_url(url).group('id', 'type')
-        webpage = self._download_webpage(f'https://tubitv.com/{video_type}/{video_id}/', video_id)
-        video_data = self._search_json(
-            r'window\.__data\s*=', webpage, 'data', video_id,
-            transform_source=js_to_json)['video']['byId'][video_id]
+        video_id = self._match_id(url)
+        url, smuggle_data = unsmuggle_url(url)
+
+        series = None
+        video_data = None
+
+        if smuggle_data:
+            # Use smuggled data for tv show
+            series = smuggle_data.get('show_title')
+            video_data = smuggle_data.get('show_data')
+        else:
+            # Get metadata from page
+            # Note: This is done instead fo downloading the JSON directly because the result from
+            #       the JSON request (https://tubitv.com/oz/videos/{video_id}/content) contains
+            #       only the episode title and not the series title.
+            webpage = self._download_webpage(f'https://tubitv.com/video/{video_id}/{video_id}', video_id)
+            page_json = self._parse_page_data(webpage, video_id)
+            video_data = traverse_obj(page_json, ('byId', video_id))
+            series_id = video_data.get('series_id')
+            if series_id:
+                series = self._get_show_title(page_json, series_id)
+        title = video_data['title']
 
         formats = []
         drm_formats = False
 
-        for resource in traverse_obj(video_data, ('video_resources', lambda _, v: url_or_none(v['manifest']['url']))):
-            resource_type = resource.get('type')
-            manifest_url = resource['manifest']['url']
-            if resource_type == 'dash':
-                formats.extend(self._extract_mpd_formats(manifest_url, video_id, mpd_id=resource_type, fatal=False))
-            elif resource_type in ('hlsv3', 'hlsv6'):
-                formats.extend(self._extract_m3u8_formats(manifest_url, video_id, 'mp4', m3u8_id=resource_type, fatal=False))
-            elif resource_type in self._UNPLAYABLE_FORMATS:
+        for resource in video_data['video_resources']:
+            if resource['type'] in ('dash', ):
+                formats += self._extract_mpd_formats(resource['manifest']['url'], video_id, mpd_id=resource['type'], fatal=False)
+            elif resource['type'] in ('hlsv3', 'hlsv6'):
+                formats += self._extract_m3u8_formats(resource['manifest']['url'], video_id, 'mp4', m3u8_id=resource['type'], fatal=False)
+            elif resource['type'] in self._UNPLAYABLE_FORMATS:
                 drm_formats = True
-            else:
-                self.report_warning(f'Skipping unknown resource type "{resource_type}"')
 
         if not formats and drm_formats:
             self.report_drm(video_id)
         elif not formats and not video_data.get('policy_match'):  # policy_match is False if content was removed
             raise ExtractorError('This content is currently unavailable', expected=True)
 
-        subtitles = {}
-        for sub in traverse_obj(video_data, ('subtitles', lambda _, v: url_or_none(v['url']))):
-            subtitles.setdefault(sub.get('lang', 'English'), []).append({
-                'url': self._proto_relative_url(sub['url']),
+        thumbnails = []
+        for thumbnail_url in video_data.get('thumbnails', []):
+            if not thumbnail_url:
+                continue
+            thumbnails.append({
+                'url': self._proto_relative_url(thumbnail_url),
             })
 
-        title = traverse_obj(video_data, ('title', {str}))
-        season_number, episode_number, episode_title = self._search_regex(
-            r'^S(\d+):E(\d+) - (.+)', title, 'episode info', fatal=False, group=(1, 2, 3), default=(None, None, None))
+        subtitles = {}
+        for sub in video_data.get('subtitles', []):
+            sub_url = sub.get('url')
+            if not sub_url:
+                continue
+            subtitles.setdefault(sub.get('lang', 'English'), []).append({
+                'url': self._proto_relative_url(sub_url),
+            })
+
+        season_number = None
+
+        # Check if this is a special episode from a show not belonging to a season
+        episode_number, episode_title = self._search_regex(
+            r'^Specials E(\d+) - (.+)', title, 'episode info', fatal=False, group=(1, 2), default=(None, None))
+
+        if episode_number or episode_title:
+            # Use season 0 for specials (common convention used by media servers)
+            season_number = 0
+        else:
+            # Try standard season/episode parsing
+            season_number, episode_number, episode_title = self._search_regex(
+                r'^S(\d+):E(\d+) - (.+)', title, 'episode info', fatal=False, group=(1, 2, 3), default=(None, None, None))
 
         return {
             'id': video_id,
             'title': title,
             'formats': formats,
             'subtitles': subtitles,
+            'thumbnails': thumbnails,
+            'description': video_data.get('description'),
+            'duration': int_or_none(video_data.get('duration')),
+            'uploader_id': video_data.get('publisher_id'),
+            'release_year': int_or_none(video_data.get('year')),
             'season_number': int_or_none(season_number),
             'episode_number': int_or_none(episode_number),
+            'series': series,
             'episode': episode_title,
-            **traverse_obj(video_data, {
-                'description': ('description', {str}),
-                'duration': ('duration', {int_or_none}),
-                'uploader_id': ('publisher_id', {str}),
-                'release_year': ('year', {int_or_none}),
-                'thumbnails': ('thumbnails', ..., {url_or_none}, {'url': {self._proto_relative_url}}),
-            }),
         }
 
 
-class TubiTvShowIE(InfoExtractor):
-    IE_NAME = 'tubitv:series'
-    _VALID_URL = r'https?://(?:www\.)?tubitv\.com/series/\d+/(?P<show_name>[^/?#]+)(?:/season-(?P<season>\d+))?'
+class TubiTvShowIE(TubiTvBaseIE):
+
+    # Show URL format: tubitv.com/series/<show_id>/<slug>
+
+    # Show ID is numeric and uniquely identifies show in Tubi API.
+    # Slug is text provided by Tubi in URL for readability/SEO. Slug can be arbitrarily
+    #    changed in URL and site will still load the correct video, so it is not necessarily
+    #    guaranteed to always be the same for the same show, unlike the ID.
+
+    _VALID_URL = r'https?://(?:www\.)?tubitv\.com/series/(?P<show_id>[0-9]+)/[^/?#]+'
     _TESTS = [{
         'url': 'https://tubitv.com/series/3936/the-joy-of-painting-with-bob-ross?start=true',
         'playlist_mincount': 389,
         'info_dict': {
-            'id': 'the-joy-of-painting-with-bob-ross',
-        },
+            'id': '3936',
+            'title': 'The Joy of Painting With Bob Ross',
+        }
     }, {
-        'url': 'https://tubitv.com/series/2311/the-saddle-club/season-1',
-        'playlist_count': 26,
+        # (Tubi original series 'The Freak Brothers', lower likelihood of becoming unavailable)
+        'url': 'https://tubitv.com/series/300007896/the-freak-brothers?start=true',
+        'playlist_mincount': 8,
         'info_dict': {
-            'id': 'the-saddle-club-season-1',
-        },
-    }, {
-        'url': 'https://tubitv.com/series/2311/the-saddle-club/season-3',
-        'playlist_count': 19,
-        'info_dict': {
-            'id': 'the-saddle-club-season-3',
-        },
-    }, {
-        'url': 'https://tubitv.com/series/2311/the-saddle-club/',
-        'playlist_mincount': 71,
-        'info_dict': {
-            'id': 'the-saddle-club',
-        },
+            'id': '300007896',
+            'title': 'The Freak Brothers',
+        }
     }]
 
-    def _entries(self, show_url, playlist_id, selected_season):
-        webpage = self._download_webpage(show_url, playlist_id)
+    def _entries(self, show_json, show_title):
 
-        data = self._search_json(
-            r'window\.__data\s*=', webpage, 'data', playlist_id,
-            transform_source=js_to_json)['video']
-
-        # v['number'] is already a decimal string, but stringify to protect against API changes
-        path = [lambda _, v: str(v['number']) == selected_season] if selected_season else [..., {dict}]
-
-        for season in traverse_obj(data, ('byId', lambda _, v: v['type'] == 's', 'seasons', *path)):
-            season_number = int_or_none(season.get('number'))
-            for episode in traverse_obj(season, ('episodes', lambda _, v: v['id'])):
-                episode_id = episode['id']
-                yield self.url_result(
-                    f'https://tubitv.com/tv-shows/{episode_id}/', TubiTvIE, episode_id,
-                    season_number=season_number, episode_number=int_or_none(episode.get('num')))
+        for episode_id in show_json['fullContentById'].keys():
+            if traverse_obj(show_json, ('byId', episode_id, 'type')) == 's':
+                continue
+            yield self.url_result(smuggle_url(f'tubitv:{episode_id}', {'show_title': show_title, 'show_data': traverse_obj(show_json, ('byId', episode_id))}), ie=TubiTvIE.ie_key(), video_id=episode_id)
 
     def _real_extract(self, url):
-        playlist_id, selected_season = self._match_valid_url(url).group('show_name', 'season')
-        if selected_season:
-            playlist_id = f'{playlist_id}-season-{selected_season}'
-        return self.playlist_result(self._entries(url, playlist_id, selected_season), playlist_id)
+        show_id = self._match_valid_url(url).group('show_id')
+        show_webpage = self._download_webpage(url, show_id)
+        show_json = self._parse_page_data(show_webpage, show_id)
+        show_title = self._get_show_title(show_json, show_id)
+        return self.playlist_result(self._entries(show_json, show_title), playlist_id=show_id, playlist_title=show_title)
