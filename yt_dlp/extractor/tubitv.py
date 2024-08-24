@@ -33,7 +33,6 @@ class TubiTvIE(TubiTvBaseIE):
                     (?P<id>[0-9]+)'''
     _LOGIN_URL = 'http://tubitv.com/login'
     _NETRC_MACHINE = 'tubitv'
-    _GEO_COUNTRIES = ['US']
     _TESTS = [{
         'url': 'https://tubitv.com/movies/383676/tracker',
         'md5': '566fa0f76870302d11af0de89511d3f0',
