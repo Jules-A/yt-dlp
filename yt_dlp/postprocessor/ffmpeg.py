@@ -106,7 +106,7 @@ class FFmpegPostProcessor(PostProcessor):
         programs = [*self._ffmpeg_to_avconv.keys(), *self._ffmpeg_to_avconv.values()]
 
         location = self.get_param('ffmpeg_location', self._ffmpeg_location.get())
-        if location is None:
+        if not isinstance(location, str) or not location:
             return {p: p for p in programs}
 
         if not os.path.exists(location):
@@ -202,7 +202,8 @@ class FFmpegPostProcessor(PostProcessor):
 
     @property
     def available(self):
-        return self.basename is not None
+        ffmpeg_loc = self._ffmpeg_location.get()
+        return self.basename is not None and (not ffmpeg_loc or os.path.exists(ffmpeg_loc))
 
     @property
     def executable(self):
