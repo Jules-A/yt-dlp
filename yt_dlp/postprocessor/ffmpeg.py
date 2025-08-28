@@ -28,6 +28,7 @@ from ..utils import (
     prepend_extension,
     replace_extension,
     shell_quote,
+    str_or_none,
     traverse_obj,
     variadic,
     write_json_file,
@@ -106,7 +107,7 @@ class FFmpegPostProcessor(PostProcessor):
         programs = [*self._ffmpeg_to_avconv.keys(), *self._ffmpeg_to_avconv.values()]
 
         location = self.get_param('ffmpeg_location', self._ffmpeg_location.get())
-        if location is None:
+        if not str_or_none(location):
             return {p: p for p in programs}
 
         if not os.path.exists(location):
@@ -202,7 +203,8 @@ class FFmpegPostProcessor(PostProcessor):
 
     @property
     def available(self):
-        return bool(self._ffmpeg_location.get()) or self.basename is not None
+        ffmpeg_loc = str_or_none(self._ffmpeg_location.get())
+        return (self.basename is not None) and (not ffmpeg_loc or os.path.exists(ffmpeg_loc))
 
     @property
     def executable(self):
