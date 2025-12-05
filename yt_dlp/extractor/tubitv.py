@@ -42,6 +42,7 @@ class TubiTvIE(InfoExtractor):
             'episode_number': 1,
             'season': 'Season 1',
             'season_number': 1,
+            'series': 'LEGO Ninjago Masters of Spinjitzu',
             'uploader_id': '2a9273e728c510d22aa5c57d0646810b',
             'release_year': 2011,
             'thumbnail': r're:^https?://.+\.(jpe?g|png)$',
@@ -97,10 +98,12 @@ class TubiTvIE(InfoExtractor):
     def _real_extract(self, url):
         video_id, video_type = self._match_valid_url(url).group('id', 'type')
         webpage = self._download_webpage(f'https://tubitv.com/{video_type}/{video_id}/', video_id)
-        video_data = self._search_json(
+        page_json = self._search_json(
             r'window\.__data\s*=', webpage, 'data', video_id,
-            transform_source=js_to_json)['video']['byId'][video_id]
-
+            transform_source=js_to_json)
+        video_data = traverse_obj(page_json, ('video', 'byId', video_id))
+        series_id = video_data.get('series_id') or video_data.get('seriesId')
+        series = traverse_obj(video_data, ('series', 'byId', '0' + series_id, 'title')) if series_id else None
         formats = []
         drm_formats = False
 
@@ -139,6 +142,7 @@ class TubiTvIE(InfoExtractor):
             'season_number': int_or_none(season_number),
             'episode_number': int_or_none(episode_number),
             'episode': strip_or_none(episode_title),
+            'series': strip_or_none(series),
             **traverse_obj(video_data, {
                 'description': ('description', {str}),
                 'duration': ('duration', {int_or_none}),
